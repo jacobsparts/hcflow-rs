@@ -1,0 +1,11 @@
+/target
+Cargo.lock
+
+# The checkpoints the engine reads are converted .safetensors files; the upstream
+# .pth originals are large and are not part of this project. See the README.
+*.pth
+/models
+
+# Python: tools/ leaves bytecode behind.
+__pycache__/
+*.pyc

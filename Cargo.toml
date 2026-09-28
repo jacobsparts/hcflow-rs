@@ -1,0 +1,37 @@
+[package]
+name = "hcflow"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, self-contained HCFlow conditional-flow super-resolution for PNGs"
+license = "MIT"
+repository = "https://github.com/jacobsparts/hcflow-rs"
+readme = "README.md"
+
+[[bin]]
+name = "hcflow"
+path = "src/main.rs"
+
+[features]
+# The default build supports both backends: `--device cpu` is pure Rust,
+# `--device gpu` uses the embedded CUDA fatbins. Building the CUDA feature
+# needs nvcc (set NVCC=/path/to/nvcc if it is not on PATH).
+default = ["cuda"]
+# Compiles cuda/hcflow.cu with nvcc and embeds the fatbins.
+cuda = []
+
+[dependencies]
+png = "0.17"
+rayon = "1"
+libc = "0.2"
+# Driver layer, module/launch/buffer plumbing and the generic kernel set.
+lightgpu = { path = "../lightgpu" }
+
+[build-dependencies]
+# Compiles this engine's kernel family and the toolkit subset it calls.
+lightgpu-build = { path = "../lightgpu/build-support" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
