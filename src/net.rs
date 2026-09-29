@@ -55,6 +55,10 @@ pub struct Options {
 
 impl Options {
     /// A run at the checkpoint's own temperature, sampling normally.
+    ///
+    /// AT ZERO THIS IS NOT A DRAW: `eps` stays absent, the latent equation
+    /// contributes a zero plane, and the result is the mean map. That is what
+    /// makes `eps_std 0` the deterministic mode rather than a very quiet sample.
     pub fn sampled(eps_std: f32) -> Options {
         Options { eps_std, eps: None }
     }

@@ -52,12 +52,14 @@ OPTIONS:
                           brought up, cpu otherwise; a CPU-only build is always
                           cpu)
         --eps-std <f>     sampling temperature (default: the checkpoint's own,
-                          0.9; 0 is deterministic)
+                          0.9; 0 is the mean, and ignores --seed)
         --seed <n>        seed for the latent noise (default: a fresh draw)
         --cpu             same as --device cpu
         --gpu             same as --device gpu, and refuses to fall back
     -q, --quiet           no progress output
         --self-test       run the CPU graph's internal checks and exit
+        --seed-test       check the seeded and unseeded noise rules on the CPU
+                          graph and exit
         --trace           walk the CPU graph stage by stage, printing each
                           plane's range (HCFLOW_TRACE_N sets the input size)
         --ref-run <lr.npy> <ref.npy>
@@ -164,6 +166,57 @@ fn draw_eps(w: &weights::Weights, in_h: usize, in_w: usize, seed: u64) -> Vec<ne
         out.push(p);
     }
     out
+}
+
+/// The seed an unseeded run draws its noise from.
+///
+/// NOT A CONSTANT, and not read from the generator's own state: a run with no
+/// `--seed` samples, which is the whole point of a flow model, and a run that
+/// repeats its own output silently is the bug this replaced. The clock is the
+/// entropy source because the only thing the value has to be is different from
+/// the last one; a caller who wants the same image twice passes `--seed`.
+fn fresh_seed() -> u64 {
+    // A counter as well as the clock: two unseeded runs in the SAME process are
+    // a nanosecond apart at worst, and the check below makes them distinct
+    // whatever the clock's resolution turns out to be.
+    static DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = DRAWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let clock = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() ^ ((d.subsec_nanos() as u64) << 32))
+        .unwrap_or(0);
+    clock ^ n.wrapping_mul(0x9E3779B97F4A7C15)
+}
+
+/// The run's sampling options: the noise planes, or their absence.
+///
+/// TWO THINGS ARE DECIDED HERE, and both used to be wrong:
+///
+///   * `eps_std == 0` IS THE MEAN. The latent is `mean + exp(eps_std * logs) *
+///     eps`, so a zero temperature contributes nothing whatever `eps` holds -
+///     but a `--seed` given to a zero-temperature run used to supply a FULL
+///     unit-normal `eps` anyway, leaving the arithmetic alone and lying in the
+///     progress line, which calls that run deterministic. The noise is dropped
+///     at zero, so `--seed` cannot quietly turn the mean back into a sample.
+///   * AN UNSEEDED RUN IS A FRESH SAMPLE. Without `--seed` the noise used to be
+///     absent altogether, which made the no-flag run an unannounced `--eps-std
+///     0` and left the checkpoint's own trained temperature reachable only
+///     alongside a seed. It is now drawn from the clock, so the default run is
+///     what the model's authors trained.
+///
+/// Both backends receive the SAME drawn planes, which is also what makes
+/// `--cuda-selftest` and `--parity` a comparison of the graph rather than of
+/// two random draws.
+fn options_for(w: &weights::Weights, in_h: usize, in_w: usize, eps_std: f32, seed: Option<u64>)
+    -> net::Options
+{
+    // The zero case is checked FIRST, so `seed` is read only by runs that
+    // actually sample.
+
+    if eps_std == 0.0 {
+        return net::Options::sampled(eps_std);
+    }
+    net::Options::with_eps(eps_std, draw_eps(w, in_h, in_w, seed.unwrap_or_else(fresh_seed)))
 }
 
 /// Read a `.npy` f32 array of shape (1, 3, h, w) - the numpy subset needed to
@@ -420,6 +473,7 @@ fn main() {
     let mut ng_test = false;
     let mut conv_bench: Option<[usize; 5]> = None;
     let mut selftest = false;
+    let mut seed_test = false;
     let mut parity = 0usize;
     let mut ref_run_args: Option<(String, String)> = None;
     // `--to-host` also DOWNLOADS the output plane to the host. `forward in Xs`
@@ -501,6 +555,7 @@ fn main() {
                 i += 2;
             }
             "--cuda-selftest" => selftest = true,
+            "--seed-test" => seed_test = true,
             "--parity" => {
                 i += 1;
                 parity = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
@@ -652,6 +707,10 @@ fn main() {
         cpu_selftest_run(&w);
         return;
     }
+    if seed_test {
+        seed_test_run(&w, eps_std.unwrap_or(w.config.eps_std));
+        return;
+    }
     if let Some((lr, rf)) = &ref_run_args {
         ref_run(&w, lr, rf);
         return;
@@ -703,15 +762,20 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Both backends draw from the SAME seeded generator, so a run with a seed
-    // is reproducible in either one - which is also what makes `--parity` a
-    // comparison of the graph rather than of two random draws.
-    let opts = match seed {
-        Some(s) => net::Options::with_eps(eps_std, draw_eps(&w, img.h, img.w, s)),
-        None => net::Options::sampled(eps_std),
-    };
-    if !quiet && eps_std == 0.0 {
-        eprintln!("eps_std 0: the map is deterministic (the reference's mean mode)");
+    let opts = options_for(&w, img.h, img.w, eps_std, seed);
+    // The sampling mode is spelled out either way, because it is the one thing
+    // about a run that its flags may not have said: the default is a DRAW, so a
+    // user seeing two different images from the same command needs to be told
+    // that is the model and how to stop it.
+    if !quiet {
+        if eps_std == 0.0 {
+            eprintln!("eps_std 0: the map is deterministic (the reference's mean mode)");
+        } else if seed.is_none() {
+            eprintln!(
+                "eps_std {eps_std}: a fresh draw every run (--seed <n> repeats one, \
+                 --eps-std 0 is the mean)"
+            );
+        }
     }
 
     HOST_SECS.with(|c| c.set(0.0));
@@ -1124,6 +1188,168 @@ fn trace_run(w: &weights::Weights, n: usize) {
         // `u` the feature was built from: passing `u` on would silently give
         // the inner level 3 channels where the graph expects 128.
         prev = Some(feature);
+    }
+}
+
+/// Compare two runs over ONE input and report whether they are the same image.
+///
+/// The output is compared as the 8-bit RGB the file would hold rather than as
+/// the float plane: byte-identity of the PNG is the property being claimed, and
+/// the quantisation is the same in both runs, so a float-level wobble below half
+/// a code value is not what this is asking about.
+fn same_output(w: &weights::Weights, img: &net::Plane, a: &net::Options, b: &net::Options)
+    -> Result<bool, String>
+{
+    // The guard is asked here rather than by going through `run_cpu`, which
+    // PRINTS a refusal and exits: a test mode has to be able to report a
+    // condition rather than die of it, and the caller is the one that knows
+    // whether "this machine cannot hold even this" is a failure or a skip.
+    if let Err(e) = memory_guard(img.h, img.w, false, 0) {
+        return Err(e);
+    }
+    let to_rgb = |p: &net::Plane| -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(p.c * p.h * p.w);
+        for i in 0..p.c {
+            for v in &p.data[i * p.h * p.w..(i + 1) * p.h * p.w] {
+                rgb.push(((v.clamp(0.0, 1.0)) * 255.0).round() as u8);
+            }
+        }
+        rgb
+    };
+    let mut quiet = |_: &str| {};
+    let pa = net::forward_cpu(w, img, a, &mut quiet)?;
+    let pb = net::forward_cpu(w, img, b, &mut quiet)?;
+    Ok(to_rgb(&pa) == to_rgb(&pb))
+}
+
+/// The seeded-noise rules, on the CPU graph.
+///
+/// hcflow-rs carries no test suite, so its numerical evidence is the `--*-test`
+/// modes, and the noise is the one part of the pipeline no other mode covers -
+/// `cpu_selftest` uses a seeded draw and never compares two runs. Both rules
+/// here are ones that have actually been wrong:
+///
+///   * TWO DIFFERENT SEEDS ARE TWO DIFFERENT IMAGES. Forcing the generator's low
+///     bit made 0 and 1 the same stream, so this is exactly the pair to test.
+///   * `eps_std 0` IS THE MEAN WHATEVER THE SEED. A zero temperature with a seed
+///     used to carry a full unit-normal `eps` and produce a sample, while the
+///     progress line called it deterministic.
+///
+/// An unseeded run is checked to draw noise at all - the temperature matters
+/// when no seed is given - but is not checked to BE random: bit-comparability
+/// between the backends depends on a run's planes being reproducible from an
+/// argument, and asserting that a clock-seeded run differs each time would
+/// assert a property of the clock.
+fn seed_test_run(w: &weights::Weights, eps_std: f32) {
+    println!("seed test: eps_std {}, checkpoint's own {}", eps_std, w.config.eps_std);
+    let n = 16usize;
+    // A non-constant input, like the other selftests use: a flat field would make
+    // the noise the only thing either backends prints, which is the opposite of
+    // what this is measuring.
+    let mut data = vec![0.0f32; 3 * n * n];
+    for y in 0..n {
+        for x in 0..n {
+            data[y * n + x] = (x as f32) / (n as f32 - 1.0);
+            data[n * n + y * n + x] = (y as f32) / (n as f32 - 1.0);
+            data[2 * n * n + y * n + x] = 0.5;
+        }
+    }
+    let img = net::Plane { c: 3, h: n, w: n, data };
+    let opts = |s: Option<u64>| options_for(w, n, n, eps_std, s);
+    let (a, b) = (opts(Some(0)), opts(Some(1)));
+    let mut ok = true;
+
+    match same_output(w, &img, &a, &b) {
+        Ok(false) => println!("seed test ok: seeds 0 and 1 are different images"),
+        Ok(true) => {
+            println!("seed test FAILED: seeds 0 and 1 are the SAME image");
+            ok = false;
+        }
+        Err(e) => {
+            println!("seed test FAILED: {e}");
+            ok = false;
+        }
+    }
+
+    match same_output(w, &img, &opts(Some(0)), &opts(Some(0))) {
+        Ok(true) => println!("seed test ok: the same seed twice is the same image"),
+        Ok(false) => {
+            println!("seed test FAILED: the same seed twice is a different image");
+            ok = false;
+        }
+        Err(e) => {
+            println!("seed test FAILED: {e}");
+            ok = false;
+        }
+    }
+
+    let mean = net::Options::sampled(0.0);
+    match same_output(w, &img, &options_for(w, n, n, 0.0, Some(0)),
+                      &options_for(w, n, n, 0.0, Some(5)))
+    {
+        Ok(true) => println!("seed test ok: eps_std 0 ignores the seed (a mean either way)"),
+        Ok(false) => {
+            println!("seed test FAILED: eps_std 0 with two seeds is two different images");
+            ok = false;
+        }
+        Err(e) => {
+            println!("seed test FAILED: {e}");
+            ok = false;
+        }
+    }
+    match same_output(w, &img, &options_for(w, n, n, 0.0, Some(0)), &mean) {
+        Ok(true) => println!("seed test ok: eps_std 0 with a seed is still the mean"),
+        Ok(false) => {
+            println!("seed test FAILED: eps_std 0 with a seed is not the mean");
+            ok = false;
+        }
+        Err(e) => {
+            println!("seed test FAILED: {e}");
+            ok = false;
+        }
+    }
+
+    // The unseeded run carries noise: at a non-zero temperature it must differ
+    // from the mean. At eps_std 0 the two ARE the same map, so the check is the
+    // other way round - and that is worth asserting too, because the absence of
+    // noise at the default temperature is the bug this replaced.
+    let unseeded = options_for(w, n, n, eps_std, None);
+    match same_output(w, &img, &unseeded, &mean) {
+        Ok(false) => println!("seed test ok: an unseeded run at eps_std {eps_std} samples"),
+        Ok(true) => {
+            if eps_std == 0.0 {
+                println!("seed test ok: an unseeded run at eps_std 0 is the mean");
+            } else {
+                println!("seed test FAILED: an unseeded run at eps_std {eps_std} carries no noise");
+                ok = false;
+            }
+        }
+        Err(e) => {
+            println!("seed test FAILED: {e}");
+            ok = false;
+        }
+    }
+
+    // Two unseeded runs in one process must be two fresh draws. This is the
+    // clock plus a counter, so it is the only place that property is visible.
+    match same_output(w, &img, &options_for(w, n, n, eps_std, None),
+                      &options_for(w, n, n, eps_std, None))
+    {
+        Ok(false) => println!("seed test ok: two unseeded runs are two fresh draws"),
+        Ok(true) => {
+            println!("seed test FAILED: two unseeded runs drew the same noise");
+            ok = false;
+        }
+        Err(e) => {
+            println!("seed test FAILED: {e}");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!("seed test ok");
+    } else {
+        std::process::exit(1)
     }
 }
 

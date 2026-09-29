@@ -16,15 +16,18 @@ hcflow -m hcflow_x4.safetensors -i photo.png -o photo_4x.png
   CPU path otherwise, so one binary covers a machine with no NVIDIA driver at
   all; `--device cpu|gpu` overrides that choice.
 * The model is STOCHASTIC. It is a conditional flow, not a regression, so the
-  latent noise is part of the output: two runs on the same input differ unless
-  the draw is fixed. `--eps-std 0` makes it deterministic and `--seed` fixes the
-  draw.
+  latent noise is part of the output: the default run draws it afresh each time,
+  and two runs on the same input differ. `--seed <n>` repeats a draw, and
+  `--eps-std 0` asks for the deterministic mean instead - no noise at all, so it
+  is the same image whether or not a seed is given.
 * Geometry comes from the checkpoint's own tensor names; `-m` is the whole
   choice.
 
 Both backends reproduce the upstream PyTorch implementation's output to within
 one level of 255 on a handful of values per image, none off by more; the CUDA
-graph and the CPU graph agree to 1.2e-6 running the same fixed draw.
+graph and the CPU graph agree to 1.2e-6 running the same fixed draw. The evidence
+is built into the binary - `--cuda-selftest`, `--prim-test`, `--ng-test` and
+`--seed-test`, the last of which checks the noise rules above.
 
 ## Download
 
@@ -49,10 +52,17 @@ variation is set by the sampling parameters, not by which file is loaded:
 
 | setting | what it does |
 |---|---|
-| default | samples at the checkpoint's own `eps_std` (0.9), a fresh draw each run |
-| `--eps-std 0` | deterministic: no noise, byte-identical output run to run |
+| default | samples at the checkpoint's own `eps_std` (0.9), drawing the noise afresh each run |
+| `--seed <n>` | draws that noise from the seed instead, so input + seed reproduces exactly |
+| `--eps-std 0` | deterministic: no noise at all, so the output is the mean and is byte-identical run to run (and a seed is ignored) |
 | `--eps-std <f>` | the temperature: below 0.9 is smoother, above is noisier |
-| `--seed <n>` | fixes the latent draw, so input + seed reproduces exactly |
+
+The mean is the reproducible image a fixed input has; a drawn sample is the
+model's characteristic texture. They are different pictures - on a detailed
+256x256 crop the two modes differ by a mean 1.5/255 with 12% of pixels off by
+more than 3 and a worst case of 144 - so a caller that needs one answer twice
+wants `--eps-std 0`, and one that wants what the authors trained wants the
+default.
 
 The checkpoint is a x4 model: a 256x256 input becomes 1024x1024.
 
@@ -72,7 +82,7 @@ hcflow -m hcflow_x4.safetensors -i photo.png -o photo_4x.png --device cpu
     --device <dev>    gpu or cpu (default: gpu when the CUDA driver can be
                       brought up, cpu otherwise)
     --eps-std <f>     sampling temperature (default: the checkpoint's own,
-                      0.9; 0 is deterministic)
+                      0.9; 0 is the mean, and ignores --seed)
     --seed <n>        seed for the latent noise (default: a fresh draw)
     --cpu             same as --device cpu
     --gpu             same as --device gpu, and refuses to fall back
