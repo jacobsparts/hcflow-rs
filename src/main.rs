@@ -101,8 +101,22 @@ MEMORY:
 struct Rng(u64);
 
 impl Rng {
+    /// Seeds the generator from a user's `--seed`.
+    ///
+    /// The seed is MIXED first, and that is the point of this function rather
+    /// than a one-line `| 1`: xorshift64* needs a non-zero state, so the low bit
+    /// is forced, but forcing it alone makes 0 and 1 the same stream, and 2 and
+    /// 3, and so on - a user asking for two draws to compare would silently get
+    /// one image twice. splitmix64 spreads the seed's bits over the whole word
+    /// before that bit is forced, so every seed is its own stream while the
+    /// state stays non-zero.
     fn new(seed: u64) -> Rng {
-        Rng(seed | 1)
+        // splitmix64: the standard mixer, chosen because it is four lines and
+        // its avalanche is good enough that the forced low bit costs nothing.
+        let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        Rng((z ^ (z >> 31)) | 1)
     }
 
     fn next_u64(&mut self) -> u64 {
