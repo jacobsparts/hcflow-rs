@@ -109,7 +109,8 @@ error: not enough memory for a 2048x2048 input on the gpu backend
 
 The Rust and CUDA code in this repository is licensed under the MIT license; see
 [LICENSE](LICENSE). This is an independent reimplementation of the HCFlow
-architecture, which is by [Zengyi-Qin](https://github.com/Zengyi-Qin/hcflow)
-and MIT licensed. The converted `.safetensors` checkpoint is a format
-conversion of the official `.pth` file, redistributed under the same MIT terms;
-the original `.pth` file is not redistributed here.
+architecture, which is by
+[JingyunLiang](https://github.com/JingyunLiang/HCFlow) and Apache-2.0 licensed.
+The converted `.safetensors` checkpoint is a format conversion of the official
+`SR_DF2K_X4_HCFlow++.pth` from the upstream Apache-2.0 release, redistributed
+under the same terms; the original `.pth` file is not redistributed here.
